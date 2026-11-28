@@ -1,0 +1,172 @@
+networks:
+  testbed-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+
+services:
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    container_name: testbed-otel-collector
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
+    environment:
+      - OTEL_GRPC_ENDPOINT=0.0.0.0:4317
+      - OTEL_HTTP_ENDPOINT=0.0.0.0:4318
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    networks:
+      - testbed-network
+
+  # Storage Infrastructure
+  postgres:
+    image: postgres:16-alpine
+    container_name: testbed-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-incidents}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-incidents}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - testbed-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: testbed-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - testbed-network
+
+  # Fault Injection Proxy (Toxiproxy)
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: testbed-toxiproxy
+    command: ["-host=0.0.0.0"]
+    ports:
+      - "${TOXIPROXY_API_PORT:-8474}:8474"       # Toxiproxy Management API
+      - "8475-8480:8475-8480"                   # Proxy listen ports
+    networks:
+      - testbed-network
+
+  # Microservices
+  gateway:
+    build:
+      context: ..
+      dockerfile: testbed/services/gateway/Dockerfile
+    container_name: testbed-gateway
+    environment:
+      SERVICE_VERSION: ${SERVICE_VERSION:-1.0.0}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      ORDERS_SERVICE_URL: http://orders:8001
+      INVENTORY_SERVICE_URL: http://inventory:8003
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    depends_on:
+      - orders
+      - inventory
+      - otel-collector
+    networks:
+      - testbed-network
+
+  orders:
+    build:
+      context: ..
+      dockerfile: testbed/services/orders/Dockerfile
+    container_name: testbed-orders
+    environment:
+      SERVICE_VERSION: ${SERVICE_VERSION:-1.0.0}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-incidents}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_TIMEOUT: ${DB_TIMEOUT:-5.0}
+      PAYMENTS_SERVICE_URL: ${PAYMENTS_SERVICE_URL:-http://payments:8002}
+      PAYMENTS_TIMEOUT_MS: ${PAYMENTS_TIMEOUT_MS:-5000}
+      INVENTORY_SERVICE_URL: http://inventory:8003
+    ports:
+      - "${ORDERS_PORT:-8001}:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      payments:
+        condition: service_started
+      inventory:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    networks:
+      - testbed-network
+
+  payments:
+    build:
+      context: ..
+      dockerfile: testbed/services/payments/Dockerfile
+    container_name: testbed-payments
+    environment:
+      SERVICE_VERSION: ${SERVICE_VERSION:-1.0.0}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      PAYMENT_PROCESSING_DELAY_MS: ${PAYMENT_PROCESSING_DELAY_MS:-20.0}
+      SIMULATE_PAYMENT_FAILURE: ${SIMULATE_PAYMENT_FAILURE:-false}
+    ports:
+      - "${PAYMENTS_PORT:-8002}:8002"
+    depends_on:
+      - otel-collector
+    networks:
+      - testbed-network
+
+  inventory:
+    build:
+      context: ..
+      dockerfile: testbed/services/inventory/Dockerfile
+    container_name: testbed-inventory
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    environment:
+      SERVICE_VERSION: ${SERVICE_VERSION:-1.0.0}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-incidents}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MEMORY_LEAK_ENABLED: ${MEMORY_LEAK_ENABLED:-false}
+      MEMORY_LEAK_CHUNK_KB: ${MEMORY_LEAK_CHUNK_KB:-1024}
+    ports:
+      - "${INVENTORY_PORT:-8003}:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - testbed-network
